@@ -23,11 +23,14 @@ constexpr uint8_t indicatorPowerPin = NEOPIXEL_POWER;
 constexpr uint8_t controlOutputPin = MISO;
 constexpr uint8_t directionOutputPin = MOSI;
 
+constexpr uint32_t relaySettlingTimeMS = 8;
+
 constexpr uint8_t openSensePin = A1;
 constexpr uint8_t closeSensePin = A0;
 
-constexpr uint8_t openPin = SCK;
-constexpr uint8_t closePin = RX;
+constexpr uint16_t analogInputThreshold = 100;
+
+constexpr uint32_t debounceTimeMS = 10;
 
 //////////////////////////////////////////////
 
@@ -36,10 +39,6 @@ constexpr float homeKitFullScale = 100.0;
 constexpr float homeKitShadeOpenValue = 100.0;
 constexpr float homeKitShadeClosedValue = 0.0;
 
-constexpr uint8_t homeKitPositionStateClosing = 0;
-constexpr uint8_t homeKitPositionStateOpening = 1;
-constexpr uint8_t homeKitPositionStateStopped = 2;
-
 //////////////////////////////////////////////
 
 constexpr uint32_t indicatorTimeoutMS = 10 * 1000;
@@ -47,25 +46,19 @@ constexpr uint32_t indicatorTimeoutMS = 10 * 1000;
 constexpr uint32_t closeTimeMS = 10 * 1000;
 constexpr uint32_t openTimeMS = 10 * 1000;
 
-constexpr uint32_t endStopExtraTime = 500;
+constexpr uint32_t endStopExtraTimeMS = 500;
 
 constexpr float closePerMS = homeKitFullScale / closeTimeMS;
 constexpr float openPerMS = homeKitFullScale / openTimeMS;
 
 constexpr uint32_t updateTimeMS = 500;
-constexpr uint32_t quickUpdateTimeMS = 100;
 
 typedef uint16_t ShadeState;
-constexpr uint16_t shadeStateOpen = 0;
-constexpr uint16_t shadeStateStopped = 1;
-constexpr uint16_t shadeStateClosed = 2;
-
 constexpr uint16_t shadeStateClosing = 1 << 3;
 constexpr uint16_t shadeStateOpening = 1 << 4;
 
 constexpr uint16_t shadeStateUserAction = 1 < 5;
-constexpr uint16_t shadeStateLocalAction = 1 << 6;
-constexpr uint16_t shadeStateHomeKitAction = 1 << 7;
+constexpr uint16_t shadeStateHomeKitAction = 1 << 6;
 
 typedef uint16_t OutputState;
 constexpr uint16_t outputStateIdle = 0;
@@ -198,23 +191,22 @@ void updateIndicator(ShadeState state, float shadePosition) {
 
 //////////////////////////////////////////////
 
-constexpr uint32_t debounceTimeMS = 10;
-
 class ButtonBase {
 	public:
 		ButtonBase(uint8_t pin) : _pin(pin) {}
-		virtual bool isPressed() { return false; };
+		virtual bool isPressed();
 		bool pressed() {
 			bool result = false;
 			bool currentPress = isPressed();
 
 			if (currentPress) {
+				uint64_t curTime = millis64();
 				if (_pressed) {
-					result = (millis64()-_pressTime) > debounceTimeMS;
+					result = (curTime-_pressTime) > debounceTimeMS;
 				}
 				else {
 					_pressed = true;
-					_pressTime = millis64();
+					_pressTime = curTime;
 				}
 			}
 			else {
@@ -237,8 +229,6 @@ class ButtonDigital : public ButtonBase {
 		bool isPressed() { return digitalRead(_pin)==LOW; };
 };
 
-constexpr uint16_t analogInputThreshold = 500;
-
 class ButtonAnalog : public ButtonBase {
 	public:
 		ButtonAnalog(uint8_t pin) : ButtonBase(pin) {};
@@ -247,19 +237,61 @@ class ButtonAnalog : public ButtonBase {
 
 //////////////////////////////////////////////
 
+class OutputPin {
+	public:
+		OutputPin(uint8_t pin) : _pin(pin) {
+			setPin(LOW);
+			pinMode(_pin, OUTPUT);
+		}
+
+		void setState(uint8_t state, uint32_t delay = 0) {
+			if (delay) {
+				_delayedState = state;
+				_delayedStateTime = millis64() + delay;
+			}
+			else {
+				setPin(state);
+			}
+		}
+
+		void clearDelayedState() {
+			_delayedState = -1;
+		}
+
+		void update(uint64_t curTime) {
+			if (_delayedState != -1 && curTime > _delayedStateTime) {
+				setPin(_delayedState);
+				clearDelayedState();
+			}
+		}
+
+		uint8_t state() { return _state; }
+
+	private:
+		uint8_t _pin = 0;
+		int16_t _state = -1;
+		int16_t _delayedState = -1;
+		uint64_t _delayedStateTime = 0;
+
+		void setPin(uint8_t state) {
+			if (state != _state) {
+				digitalWrite(_pin, state);
+				_state = state;
+			}
+		}
+};
+
 struct RVShade : Service::WindowCovering {
-	SpanCharacteristic* _positionState = NULL;
 	SpanCharacteristic* _currentPosition = NULL;
 	SpanCharacteristic* _targetPosition = NULL;
-	SpanCharacteristic* _holdPosition = NULL;
-
-	ButtonDigital* _localOpenButton = NULL;
-	ButtonDigital* _localCloseButton = NULL;
 
 	ButtonAnalog* _userOpenButton = NULL;
 	ButtonAnalog* _userCloseButton = NULL;
 
-	ShadeState _shadeState = shadeStateOpen;
+	OutputPin* _controlPin = NULL;
+	OutputPin* _directionPin = NULL;
+
+	ShadeState _shadeState = 0;
 	float _currentShadePosition = homeKitShadeOpenValue;
 	uint64_t _nextPositionUpdateTime = 0;
 
@@ -267,29 +299,21 @@ struct RVShade : Service::WindowCovering {
 
 	uint64_t _operationEndTime;
 
-	bool _doHoldPosition = false;
-
 	RVShade() : Service::WindowCovering() {
-		_positionState = new Characteristic::PositionState(homeKitPositionStateStopped);
 		_currentPosition = new Characteristic::CurrentPosition(homeKitShadeOpenValue);
 		_targetPosition = new Characteristic::TargetPosition(homeKitShadeOpenValue);
-		_holdPosition = new Characteristic::HoldPosition();
 
-		_localOpenButton = new ButtonDigital(openPin);
-		_localCloseButton = new ButtonDigital(closePin);
 		_userOpenButton = new ButtonAnalog(openSensePin);
 		_userCloseButton = new ButtonAnalog(closeSensePin);
 
-		digitalWrite(controlOutputPin, LOW);
-		pinMode(controlOutputPin, OUTPUT);
-		digitalWrite(directionOutputPin, LOW);
-		pinMode(directionOutputPin, OUTPUT);
+		_controlPin = new OutputPin(controlOutputPin);
+		_directionPin = new OutputPin(directionOutputPin);
 	}
 
 	boolean update() {
-		uint64_t curTime = millis64();
-
 		if (_targetPosition->updated()) {
+			uint64_t curTime = millis64();
+
 			float targetValue = _targetPosition->getNewVal<float>();
 			float moveAmount = targetValue - _currentShadePosition;
 			uint32_t moveTimeMS = abs(moveAmount / homeKitFullScale) * ((moveAmount > 0) ? openTimeMS : closeTimeMS);
@@ -297,7 +321,7 @@ struct RVShade : Service::WindowCovering {
 			_operationEndTime = curTime + moveTimeMS;
 
 			if (targetValue == homeKitShadeClosedValue || targetValue == homeKitShadeOpenValue) {
-				_operationEndTime += endStopExtraTime;
+				_operationEndTime += endStopExtraTimeMS;
 			}
 
 			_shadeState = shadeStateHomeKitAction | ((moveAmount > 0) ? shadeStateOpening : shadeStateClosing);
@@ -305,140 +329,102 @@ struct RVShade : Service::WindowCovering {
 			SerPrintf("Changing position from %0.1f%% to %0.1f%% over %dmS.\n", _currentShadePosition, targetValue, (int)(_operationEndTime-curTime));
 			SerPrintf("State changed to 0x%02X\n", _shadeState);
 		}
-		if (_holdPosition && _holdPosition->updated()) {
-			SerPrintf("Hold position.\n");
-			_doHoldPosition = true;
-		}
-
 		return true;
 	}
 
 	void loop() {
 		static uint64_t lastTime = 0;
 		uint64_t curTime = millis64();
-		ShadeState newShadeState;
 
 		if (lastTime == 0) {
 			lastTime = curTime;
 		}
 
 		if (curTime > lastTime) {
-			bool userOpen = false; // _userOpenButton->pressed();
-			bool userClose = false; // _userCloseButton->pressed();
-			bool localOpen = _localOpenButton->pressed();
-			bool localClose = _localCloseButton->pressed();
-			bool updateState = false;
-
-			if (userOpen) {
-				newShadeState = shadeStateOpening | shadeStateUserAction;
+			if (_userOpenButton->pressed()) {
+				_shadeState = shadeStateUserAction | shadeStateOpening;
 			}
-			else if (userClose) {
-				newShadeState = shadeStateClosing | shadeStateUserAction;
+			else if (_userCloseButton->pressed()) {
+				_shadeState = shadeStateUserAction | shadeStateClosing;
 			}
-			else if (localOpen) {
-				newShadeState = shadeStateOpening | shadeStateLocalAction;
-			}
-			else if (localClose) {
-				newShadeState = shadeStateClosing | shadeStateLocalAction;
-			}
-			else if (_shadeState & shadeStateHomeKitAction) {
-				if (curTime >= _operationEndTime || _doHoldPosition) {
-					SerPrintf("HomeKit operation complete.\n");
-					updateState = true;
-					_nextPositionUpdateTime = min(_nextPositionUpdateTime, curTime + quickUpdateTimeMS);
-				}
-				else {
-					newShadeState = _shadeState;
-				}
-			}
-			else {
-				updateState = true;
+			else if (_shadeState & shadeStateUserAction) {
+				_shadeState = 0;
 			}
 
-			if (updateState) {
-				if (_currentShadePosition == homeKitShadeOpenValue) {
-					newShadeState = shadeStateOpen;
-				}
-				else if (_currentShadePosition == homeKitShadeClosedValue) {
-					newShadeState = shadeStateClosed;
-				}
-				else {
-					newShadeState = shadeStateStopped;
+			bool moving = (_shadeState & (shadeStateOpening | shadeStateClosing)) != 0;
+			bool movingOpen = (_shadeState & shadeStateOpening) != 0;
+
+			if (moving) {
+				_currentShadePosition += (curTime - lastTime) * ((movingOpen) ? openPerMS : -closePerMS);
+				_currentShadePosition = max(homeKitShadeClosedValue, min(homeKitShadeOpenValue, _currentShadePosition));
+
+				if (_shadeState & shadeStateHomeKitAction && curTime > _operationEndTime) {
+					_shadeState = 0;
+					SerPrintf("Homekit operation complete.\n");
 				}
 			}
 
-			if (_holdPosition && _doHoldPosition) {
-				_holdPosition->setVal(false, false);
-				_doHoldPosition = false;
-			}
+			OutputState newOutputState;
 
-			bool moving = (newShadeState & (shadeStateOpening | shadeStateClosing)) != 0;
-			bool movingOpen = (newShadeState & shadeStateOpening) != 0;
-
-			if (newShadeState == _shadeState) {
-				if (moving) {
-					_currentShadePosition += (curTime - lastTime) * ((movingOpen) ? openPerMS : -closePerMS);
-					_currentShadePosition = max(homeKitShadeClosedValue, min(homeKitShadeOpenValue, _currentShadePosition));
-				}
+			if (_shadeState & shadeStateHomeKitAction) {
+				newOutputState = (_shadeState & shadeStateOpening) ? outputStateOpen : outputStateClose;
 			}
 			else {
-				OutputState newOutputState;
+				newOutputState = outputStateIdle;
+			}
 
-				SerPrintf("State changed to 0x%02X\n", newShadeState);
+			if (newOutputState != _outputState) {
+				SerPrintf("Output state changed to %d\n", newOutputState);
 
-				if (newShadeState & (shadeStateLocalAction | shadeStateHomeKitAction)) {
-					newOutputState = (movingOpen) ? outputStateOpen : outputStateClose;
+				_controlPin->clearDelayedState();
+				_directionPin->clearDelayedState();
+
+				bool newDirectionOutputState;
+				bool newControlOutputState;
+
+				if (newOutputState == outputStateOpen) {
+					newDirectionOutputState = LOW;
+					newControlOutputState = HIGH;
+				}
+				else if (newOutputState == outputStateClose) {
+					newDirectionOutputState = HIGH;
+					newControlOutputState = HIGH;
 				}
 				else {
-					newOutputState = outputStateIdle;
+					newDirectionOutputState = LOW;
+					newControlOutputState = LOW;
 				}
 
-				if (newOutputState != _outputState) {
-					SerPrintf("Output state set to %d\n", newOutputState);
-
-					if (newOutputState == outputStateOpen) {
-						digitalWrite(directionOutputPin, LOW);
-						digitalWrite(controlOutputPin, HIGH);
+				if (newDirectionOutputState != _directionPin->state() && newControlOutputState != _controlPin->state()) {
+					if (newControlOutputState == HIGH) {		// direction  needs time to settle before setting control
+						_controlPin->setState(newControlOutputState, relaySettlingTimeMS);
+						_directionPin->setState(newDirectionOutputState, 0);
 					}
-					else if (newOutputState == outputStateClose) {
-						digitalWrite(directionOutputPin, HIGH);
-						digitalWrite(controlOutputPin, HIGH);
+					else {									// direction needs to hold while control settles
+						_controlPin->setState(newControlOutputState, 0);
+						_directionPin->setState(newDirectionOutputState, relaySettlingTimeMS);
 					}
-					else {
-						digitalWrite(directionOutputPin, LOW);
-						digitalWrite(controlOutputPin, LOW);
-					}
-					_outputState = newOutputState;
 				}
+				else {
+					_controlPin->setState(newControlOutputState, 0);
+					_directionPin->setState(newDirectionOutputState, 0);
+				}
+
+				_outputState = newOutputState;
 
 				if (_nextPositionUpdateTime == 0) {
 					_nextPositionUpdateTime = curTime + updateTimeMS;
 				}
-
-				_shadeState = newShadeState;
 			}
 
 			if (_nextPositionUpdateTime>0 && curTime>=_nextPositionUpdateTime) {
-				SerPrintf("Position changed to %0.1f%% - output=%d\n", _currentShadePosition, _outputState);
-
-				_currentPosition->setVal(_currentShadePosition);
-				if (newShadeState & (shadeStateUserAction | shadeStateLocalAction)) {
-					_targetPosition->setVal(_currentShadePosition);
+				if (_currentPosition->getVal<float>() != _currentShadePosition) {
+					_currentPosition->setVal(_currentShadePosition);
+					SerPrintf("Position changed to %0.1f%% - output=%d\n", _currentShadePosition, _outputState);
 				}
-
-				uint16_t newPositionState;
-				if (moving) {
-					newPositionState = (movingOpen) ? homeKitPositionStateOpening : homeKitPositionStateClosing;
-				}
-				else {
-					newPositionState = homeKitPositionStateStopped;
-				}
-
-				if (newPositionState != _positionState->getVal()) {
-					SerPrintf("PositionState set to %d\n", newPositionState);
-
-					_positionState->setVal(newPositionState);
-				}
+				// if (_shadeState & shadeStateUserAction && _targetPosition->getVal<float>() != _currentShadePosition) {
+				// 	_targetPosition->setVal(_currentShadePosition);
+				// }
 
 				_nextPositionUpdateTime = 0;
 			}
@@ -446,6 +432,9 @@ struct RVShade : Service::WindowCovering {
 			if (moving && _nextPositionUpdateTime == 0) {
 				_nextPositionUpdateTime = curTime + updateTimeMS;
 			}
+
+			_controlPin->update(curTime);
+			_directionPin->update(curTime);
 
 			updateIndicator(_shadeState, _currentShadePosition);
 
