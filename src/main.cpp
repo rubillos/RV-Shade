@@ -14,19 +14,24 @@ constexpr const char* versionString = "v0.1";
 
 constexpr const char* accessoryName = "Front Shade";
 
-constexpr const char* displayName = "Shade-Controller";
+constexpr const char* displayName = "RV-Shade-Controller";
 constexpr const char* modelName = "Shade-Controller-ESP32";
 
-constexpr uint8_t indicatorDataPin = PIN_NEOPIXEL;
-constexpr uint8_t indicatorPowerPin = NEOPIXEL_POWER;
+#if 0
+constexpr int16_t indicatorDataPin = PIN_NEOPIXEL;
+constexpr int16_t indicatorPowerPin = NEOPIXEL_POWER;
+#else
+constexpr int16_t indicatorDataPin = RX;
+constexpr int16_t indicatorPowerPin = -1;
+#endif
 
 constexpr uint8_t controlOutputPin = MISO;
 constexpr uint8_t directionOutputPin = MOSI;
 
 constexpr uint32_t relaySettlingTimeMS = 8;
 
-constexpr uint8_t openSensePin = A1;
-constexpr uint8_t closeSensePin = A0;
+constexpr uint8_t openSensePin = A0;
+constexpr uint8_t closeSensePin = A1;
 
 constexpr uint16_t analogInputThreshold = 100;
 
@@ -39,12 +44,16 @@ constexpr float homeKitFullScale = 100.0;
 constexpr float homeKitShadeOpenValue = 100.0;
 constexpr float homeKitShadeClosedValue = 0.0;
 
+constexpr int homekitPositionStateClosing = 0;
+constexpr int homekitPositionStateOpening = 1;
+constexpr int homekitPositionStateStopped = 2;
+
 //////////////////////////////////////////////
 
-constexpr uint32_t indicatorTimeoutMS = 10 * 1000;
+constexpr uint32_t indicatorTimeoutMS = 30 * 1000;
 
-constexpr uint32_t closeTimeMS = 10 * 1000;
-constexpr uint32_t openTimeMS = 10 * 1000;
+constexpr uint32_t closeTimeMS = 13 * 1000;
+constexpr uint32_t openTimeMS = 15 * 1000;
 
 constexpr uint32_t endStopExtraTimeMS = 500;
 
@@ -106,13 +115,11 @@ constexpr uint32_t whiteColorFlag = 1 << 24;
 
 constexpr uint32_t blackColor = MAKE_RGB_STATUS(0, 0, 0);
 constexpr uint32_t flashColor = MAKE_RGB_STATUS(1, 0, 1);
-constexpr uint32_t startColor = MAKE_RGB_STATUS(0, 1, 0);
+constexpr uint32_t startColor = MAKE_RGB_STATUS(0, 1, 1);
 constexpr uint32_t connectingColor = MAKE_RGB_STATUS(0, 0, 1);
-constexpr uint32_t offColor = MAKE_RGB_STATUS(0, 1, 1);
-constexpr uint32_t sendColor = MAKE_RGB_STATUS(1, 1, 1);
 
-constexpr uint32_t openColor = MAKE_RGB(1, 0, 0);
-constexpr uint32_t closedColor = MAKE_RGB(1, 1, 0);
+constexpr uint32_t openColor = MAKE_RGB(0, 1, 0);
+constexpr uint32_t closedColor = MAKE_RGB(1, 0, 0);
 
 uint32_t makeShadeColor(float level) {
 	constexpr uint8_t ledBright = 30;
@@ -144,7 +151,7 @@ void setIndicator(uint32_t color) {
 			indicator.setPixelColor(0, color, color, color);
 		}
 		else {
-			indicator.setPixelColor(0, color>>16, (color >> 8) & 0xFF, color & 0xFF);
+			indicator.setPixelColor(0, R_COMP(color), G_COMP(color), B_COMP(color));
 		}
 		indicator.show();
 	}
@@ -183,7 +190,7 @@ void updateIndicator(ShadeState state, float shadePosition) {
 		color = blackColor;
 	}
 	else {
-		color = makeShadeColor(shadePosition);
+		color = makeShadeColor(shadePosition / homeKitFullScale);
 	}
 
 	setIndicator(color);
@@ -284,6 +291,7 @@ class OutputPin {
 struct RVShade : Service::WindowCovering {
 	SpanCharacteristic* _currentPosition = NULL;
 	SpanCharacteristic* _targetPosition = NULL;
+	SpanCharacteristic* _positionState = NULL;
 
 	ButtonAnalog* _userOpenButton = NULL;
 	ButtonAnalog* _userCloseButton = NULL;
@@ -302,6 +310,7 @@ struct RVShade : Service::WindowCovering {
 	RVShade() : Service::WindowCovering() {
 		_currentPosition = new Characteristic::CurrentPosition(homeKitShadeOpenValue);
 		_targetPosition = new Characteristic::TargetPosition(homeKitShadeOpenValue);
+		_positionState = new Characteristic::PositionState(homekitPositionStateStopped);
 
 		_userOpenButton = new ButtonAnalog(openSensePin);
 		_userCloseButton = new ButtonAnalog(closeSensePin);
@@ -341,6 +350,9 @@ struct RVShade : Service::WindowCovering {
 		}
 
 		if (curTime > lastTime) {
+			bool needPositionUpdate = false;
+			bool needTargetUpdate = false;
+
 			if (_userOpenButton->pressed()) {
 				_shadeState = shadeStateUserAction | shadeStateOpening;
 			}
@@ -349,6 +361,7 @@ struct RVShade : Service::WindowCovering {
 			}
 			else if (_shadeState & shadeStateUserAction) {
 				_shadeState = 0;
+				needTargetUpdate = true;
 			}
 
 			bool moving = (_shadeState & (shadeStateOpening | shadeStateClosing)) != 0;
@@ -359,6 +372,7 @@ struct RVShade : Service::WindowCovering {
 				_currentShadePosition = max(homeKitShadeClosedValue, min(homeKitShadeOpenValue, _currentShadePosition));
 
 				if (_shadeState & shadeStateHomeKitAction && curTime > _operationEndTime) {
+					_currentShadePosition = _targetPosition->getVal<float>();
 					_shadeState = 0;
 					SerPrintf("Homekit operation complete.\n");
 				}
@@ -411,21 +425,29 @@ struct RVShade : Service::WindowCovering {
 				}
 
 				_outputState = newOutputState;
-
-				if (_nextPositionUpdateTime == 0) {
-					_nextPositionUpdateTime = curTime + updateTimeMS;
-				}
+				needPositionUpdate = true;
 			}
 
-			if (_nextPositionUpdateTime>0 && curTime>=_nextPositionUpdateTime) {
+			if (needPositionUpdate || needTargetUpdate || (_nextPositionUpdateTime>0 && curTime > _nextPositionUpdateTime)) {
+				if (needTargetUpdate || _shadeState & shadeStateUserAction) {
+					float nextPosition = _currentShadePosition;
+					
+					if (_shadeState & shadeStateOpening) {
+						 nextPosition = min(homeKitShadeOpenValue, _currentShadePosition + openPerMS * updateTimeMS);
+					}
+					else if (_shadeState & shadeStateClosing) {
+						 nextPosition = max(homeKitShadeClosedValue, _currentShadePosition - closePerMS * updateTimeMS);
+					}
+
+					if (_targetPosition->getVal<float>() != nextPosition) {
+						_targetPosition->setVal(nextPosition);
+						SerPrintf("Target changed to %0.1f%%\n", nextPosition);
+					}
+				}
 				if (_currentPosition->getVal<float>() != _currentShadePosition) {
 					_currentPosition->setVal(_currentShadePosition);
 					SerPrintf("Position changed to %0.1f%% - output=%d\n", _currentShadePosition, _outputState);
 				}
-				// if (_shadeState & shadeStateUserAction && _targetPosition->getVal<float>() != _currentShadePosition) {
-				// 	_targetPosition->setVal(_currentShadePosition);
-				// }
-
 				_nextPositionUpdateTime = 0;
 			}
 
@@ -437,6 +459,11 @@ struct RVShade : Service::WindowCovering {
 			_directionPin->update(curTime);
 
 			updateIndicator(_shadeState, _currentShadePosition);
+
+			int movingState = (moving) ? ((movingOpen ? homekitPositionStateOpening : homekitPositionStateClosing)) : homekitPositionStateStopped;
+			if (movingState != _positionState->getVal()) {
+				_positionState->setVal(movingState);
+			}
 
 			lastTime = curTime;
 		}
@@ -474,9 +501,11 @@ void wifiReady() {
 //////////////////////////////////////////////
 
 void setup() {
-	pinMode(indicatorPowerPin, OUTPUT);
-	digitalWrite(indicatorPowerPin, HIGH);
-
+	if (indicatorPowerPin != -1) {
+		pinMode(indicatorPowerPin, OUTPUT);
+		digitalWrite(indicatorPowerPin, HIGH);
+	}
+	
 	indicator.begin();
 
 	#ifdef DEBUG
@@ -491,6 +520,7 @@ void setup() {
 	homeSpan.setSketchVersion(versionString);
 	homeSpan.setWifiCallback(wifiReady);
 	homeSpan.setStatusCallback(statusChanged);
+	homeSpan.enableWebLog(50);
 	homeSpan.begin(Category::Bridges, displayName, DEFAULT_HOST_NAME, modelName);
 
 	SerPrintf("Create devices...\n");
